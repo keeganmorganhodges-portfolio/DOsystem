@@ -1,88 +1,106 @@
-import {
-	type Connection,
-	Server,
-	type WSMessage,
-	routePartykitRequest,
-} from "partyserver";
+import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
+import * as jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
-import type { ChatMessage, Message } from "../shared";
+// Validation Schemas
+const RegisterSchema = z.object({
+  email: z.string().email(),
+  username: z.string().min(3).max(20),
+  password: z.string().min(8)
+});
 
-export class CHAT extends Server<Env> {
-	static options = { hibernate: true };
+const LoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string()
+});
 
-	messages = [] as ChatMessage[];
+const WSMsgSchema = z.object({
+  type: z.enum(["add", "typing", "delete", "reaction"]),
+  content: z.string().max(2000).optional(),
+  roomId: z.string(),
+  tempId: z.string().optional()
+});
 
-	broadcastMessage(message: Message, exclude?: string[]) {
-		this.broadcast(JSON.stringify(message), exclude);
-	}
+export class Chat extends DurableObject {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+  }
 
-	onStart() {
-		// this is where you can initialize things that need to be done before the server starts
-		// for example, load previous messages from a database or a service
+  async fetch(request: Request) {
+    if (request.headers.get("Upgrade") !== "websocket") return new Response(null, { status: 400 });
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    return new Response(null, { status: 101, webSocketWait: pair[0] });
+  }
 
-		// create the messages table if it doesn't exist
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
-		);
+  async webSocketMessage(ws: WebSocket, message: string) {
+    const data = WSMsgSchema.parse(JSON.parse(message));
+    const session = ws.deserialize(); // In production, verify user from DO attachment
 
-		// load the messages from the database
-		this.messages = this.ctx.storage.sql
-			.exec(`SELECT * FROM messages`)
-			.toArray() as ChatMessage[];
-	}
+    if (data.type === "typing") {
+      this.broadcast({ type: "typing", user: session.username }, ws);
+      return;
+    }
 
-	onConnect(connection: Connection) {
-		connection.send(
-			JSON.stringify({
-				type: "all",
-				messages: this.messages,
-			} satisfies Message),
-		);
-	}
+    if (data.type === "add") {
+      // Direct D1 write for persistence
+      const id = crypto.randomUUID();
+      await this.env.DB.prepare(
+        "INSERT INTO messages (id, room_id, user_id, content) VALUES (?, ?, ?, ?)"
+      ).bind(id, data.roomId, session.userId, data.content).run();
 
-	saveMessage(message: ChatMessage) {
-		// check if the message already exists
-		const existingMessage = this.messages.find((m) => m.id === message.id);
-		if (existingMessage) {
-			this.messages = this.messages.map((m) => {
-				if (m.id === message.id) {
-					return message;
-				}
-				return m;
-			});
-		} else {
-			this.messages.push(message);
-		}
+      this.broadcast({
+        type: "add",
+        id,
+        tempId: data.tempId,
+        content: data.content,
+        user: session.username,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
 
-		// Use parameterized queries to prevent SQL injection
-		this.ctx.storage.sql.exec(
-			`INSERT INTO messages (id, user, role, content) VALUES (?, ?, ?, ?)
-			 ON CONFLICT (id) DO UPDATE SET content = ?`,
-			message.id,
-			message.user,
-			message.role,
-			message.content,
-			message.content,
-		);
-	}
-
-	onMessage(connection: Connection, message: WSMessage) {
-		// let's broadcast the raw message to everyone else
-		this.broadcast(message);
-
-		// let's update our local messages store
-		const parsed = JSON.parse(message as string) as Message;
-		if (parsed.type === "add" || parsed.type === "update") {
-			this.saveMessage(parsed);
-		}
-	}
+  broadcast(msg: any, exclude?: WebSocket) {
+    this.ctx.getWebSockets().forEach(client => {
+      if (client !== exclude) client.send(JSON.stringify(msg));
+    });
+  }
 }
 
 export default {
-	async fetch(request, env) {
-		return (
-			(await routePartykitRequest(request, { ...env })) ||
-			env.ASSETS.fetch(request)
-		);
-	},
-} satisfies ExportedHandler<Env>;
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 1. WebSocket Routing
+    if (request.headers.get("Upgrade") === "websocket") {
+      const roomId = url.searchParams.get("roomId") || "general";
+      const id = env.CHAT.idFromName(roomId);
+      return env.CHAT.get(id).fetch(request);
+    }
+
+    // 2. Auth API
+    if (url.pathname === "/api/auth/register") {
+      const body = RegisterSchema.parse(await request.json());
+      const hash = await bcrypt.hash(body.password, 10);
+      await env.DB.prepare("INSERT INTO users (email, username, password_hash) VALUES (?, ?, ?)")
+        .bind(body.email, body.username, hash).run();
+      return Response.json({ success: true });
+    }
+
+    if (url.pathname === "/api/auth/login") {
+      const body = LoginSchema.parse(await request.json());
+      const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(body.email).first();
+      if (!user || !(await bcrypt.compare(body.password, user.password_hash as string))) {
+        return new Response("Invalid credentials", { status: 401 });
+      }
+      const token = jwt.sign({ userId: user.id, username: user.username }, env.JWT_SECRET);
+      return new Response(JSON.stringify({ user }), {
+        headers: { "Set-Cookie": `session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/` }
+      });
+    }
+
+    // 3. Asset Serving (SPA Mode)
+    return await env.ASSETS.fetch(request).catch(() => env.ASSETS.fetch(new Request(url.origin + "/index.html")));
+  }
+};
