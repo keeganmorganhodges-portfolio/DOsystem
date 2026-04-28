@@ -1,6 +1,6 @@
 {
-	"name": "chat",
-	"description": "Chat with other users in real-time using Durable Objects and PartyKit.",
+	"name": "Keegan DA Hacker Chat",
+	"description": "Chat with other users across the world in real-time using Durable Objects, PartyKit and Keegan DA Hacker SERVER API.",
 	"cloudflare": {
 		"label": "Durable Chat App",
 		"products": [
