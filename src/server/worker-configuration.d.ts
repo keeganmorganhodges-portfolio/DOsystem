@@ -4,10 +4,10 @@
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./index");
-		durableNamespaces: "Chat";
+		durableNamespaces: "CHAT";
 	}
 	interface Env {
-		Chat: DurableObjectNamespace<import("./index").Chat>;
+		CHAT: DurableObjectNamespace<import("./index").CHAT>;
 		ASSETS: Fetcher;
 	}
 }
